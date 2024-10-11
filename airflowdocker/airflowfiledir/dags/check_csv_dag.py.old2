@@ -1,0 +1,141 @@
+import os
+import time
+import subprocess
+import shutil
+from kafka import KafkaProducer
+
+# Ruta del archivo CSV que vamos a chequear
+CSV_FILE_PATH = "/app/rows.csv"
+# Ruta del script de procesamiento
+SCRIPT_PATH = "/app/script1.py"
+
+# Función para dividir el archivo en fragmentos más pequeños
+def split_file(input_file, chunk_size_mb=100):
+    """Divide el archivo CSV en trozos de tamaño especificado en MB y devuelve las rutas de los fragmentos"""
+    chunk_size_bytes = chunk_size_mb * 1024 * 1024  # Convertir MB a Bytes
+    output_files = []
+    
+    # Abrimos el archivo original en modo binario
+    with open(input_file, 'rb') as f:
+        chunk_count = 0
+        while True:
+            chunk = f.read(chunk_size_bytes)
+            if not chunk:
+                break
+            # Crear un nuevo archivo para el fragmento
+            chunk_filename = f"{input_file}.part{chunk_count + 1}"
+            output_files.append(chunk_filename)
+            with open(chunk_filename, 'wb') as chunk_file:
+                chunk_file.write(chunk)
+            chunk_count += 1
+    
+    return output_files
+
+# Función para enviar el archivo a HDFS en fragmentos
+def send_csv_file():
+    """Envía el archivo dividido en fragmentos pequeños a HDFS y manda un mensaje a Kafka"""
+    hdfs_path_prefix = "/user/airflow/rows_part"  # Prefijo para el nombre del archivo en HDFS
+    kafka_topic = "spark_input_topic"  # Tópico Kafka para enviar la ruta
+    bootstrap_servers = ['localhost:6002']  # Cambia según tu servidor Kafka
+
+    if not os.path.exists(CSV_FILE_PATH):
+        raise FileNotFoundError(f"{CSV_FILE_PATH} no existe")
+
+    # Dividir el archivo en fragmentos de 100MB
+    chunks = split_file(CSV_FILE_PATH, chunk_size_mb=100)
+
+    # Para cada trozo del archivo
+    for chunk in chunks:
+        # Subir el fragmento a HDFS
+        hdfs_path = f"{hdfs_path_prefix}_{os.path.basename(chunk)}"
+        result = subprocess.run(
+            ["hdfs", "dfs", "-put", chunk, hdfs_path],
+            capture_output=True,
+            text=True
+        )
+
+        if result.returncode != 0:
+            raise Exception(f"Error al subir el fragmento a HDFS: {result.stderr}")
+        
+        print(f"Fragmento {chunk} subido a HDFS: {hdfs_path}")
+
+        # Enviar la ruta del fragmento a Kafka
+        send_kafka_message(kafka_topic, hdfs_path)
+
+        # Eliminar el fragmento local después de subirlo
+        os.remove(chunk)
+
+def send_kafka_message(topic, message):
+    """Envía un mensaje a Kafka con la ruta del archivo"""
+    producer = KafkaProducer(bootstrap_servers=['localhost:6002'])
+
+    future = producer.send(topic, message.encode('utf-8'))
+    result = future.get(timeout=10)
+    print(f"Mensaje enviado a Kafka al tópico {topic}: {message}")
+    
+    # Cerrar el productor
+    producer.close()
+
+def check_csv_update():
+    """Función que chequeará si el archivo CSV ha sido modificado."""
+    if not os.path.exists(CSV_FILE_PATH):
+        raise FileNotFoundError(f"{CSV_FILE_PATH} no existe")
+
+    # Obtener la hora de la última modificación del archivo
+    last_modified_time = os.path.getmtime(CSV_FILE_PATH)
+
+    # Hora actual
+    current_time = time.time()
+
+    # Si el archivo fue modificado en las últimas 24 horas, se considera nuevo
+    if current_time - last_modified_time < 86400:  # 86400 segundos = 24 horas
+        return True
+    return False
+
+def process_csv():
+    """Llama al script de Python para procesar el CSV e insertar los datos en MongoDB."""
+    result = subprocess.run(["python", SCRIPT_PATH], capture_output=True, text=True)
+    if result.returncode != 0:
+        raise Exception(f"Error al procesar el CSV: {result.stderr}")
+    print(f"Resultado del procesamiento: {result.stdout}")
+
+# Definir el DAG
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+from airflow.utils.dates import days_ago
+
+default_args = {
+    'owner': 'airflow',
+    'start_date': days_ago(1),
+    'retries': 1
+}
+
+with DAG(
+    dag_id='check_and_process_csv_dag',
+    default_args=default_args,
+    schedule_interval='@daily',  # Chequeo diario
+    catchup=False
+) as dag:
+
+    check_csv = PythonOperator(
+        task_id='check_csv',
+        python_callable=check_csv_update
+    )
+
+    process_data = PythonOperator(
+        task_id='process_data',
+        python_callable=process_csv
+    )
+
+    send_data = PythonOperator(
+        task_id='send_data',
+        python_callable=send_csv_file
+    )
+
+    send_path = PythonOperator(
+        task_id='send_path',
+        python_callable=send_csv_file
+    )
+
+    # Definir la secuencia de tareas
+    check_csv >> send_data >> send_path

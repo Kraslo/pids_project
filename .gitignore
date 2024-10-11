@@ -1,0 +1,6 @@
+sparkprograms/rows.csv.part*
+airflowdocker/**/*.log
+csv_volume/rows.csv
+.local
+.ssh
+.cache

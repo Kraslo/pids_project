@@ -1,0 +1,14 @@
+# Configuración básica de SSH para habilitar SFTP
+PermitRootLogin no
+PasswordAuthentication yes
+ChallengeResponseAuthentication no
+UsePAM no
+
+# Configurar el acceso solo SFTP para el usuario sftpuser
+Subsystem sftp /usr/lib/openssh/sftp-server
+
+# Asegurar que solo se pueda acceder mediante SFTP
+Match User sftpuser
+    ChrootDirectory /home/sftpuser
+    ForceCommand internal-sftp
+    AllowTcpForwarding no

@@ -1,0 +1,115 @@
+from airflow import DAG
+from airflow.operators.python import PythonOperator  # Corregido para usar el nuevo PythonOperator
+from airflow.utils.dates import days_ago
+import os
+import time
+import subprocess
+from kafka import KafkaProducer
+
+# Ruta del archivo CSV que vamos a chequear
+CSV_FILE_PATH = "/app/rows.csv"
+
+# Ruta del script de procesamiento
+SCRIPT_PATH = "/app/script1.py"
+
+def check_csv_update():
+    """Función que chequeará si el archivo CSV ha sido modificado."""
+    if not os.path.exists(CSV_FILE_PATH):
+        raise FileNotFoundError(f"{CSV_FILE_PATH} no existe")
+
+    # Obtener la hora de la última modificación del archivo
+    last_modified_time = os.path.getmtime(CSV_FILE_PATH)
+
+    # Hora actual
+    current_time = time.time()
+
+    # Si el archivo fue modificado en las últimas 24 horas, se considera nuevo
+    if current_time - last_modified_time < 86400:  # 86400 segundos = 24 horas
+        return True
+    return False
+
+def process_csv():
+    """Llama al script de Python para procesar el CSV e insertar los datos en MongoDB."""
+    result = subprocess.run(["python", SCRIPT_PATH], capture_output=True, text=True)
+    if result.returncode != 0:
+        raise Exception(f"Error al procesar el CSV: {result.stderr}")
+    print(f"Resultado del procesamiento: {result.stdout}")
+
+def send_csv_file():
+    """Manda el archivo desde airflow a HDSF""""
+    hdfs_path = "/user/airflow/rows.csv"  # Cambia esto según tu ruta en HDFS
+
+    if not os.path.exists(CSV_FILE_PATH):
+        raise FileNotFoundError(f"{CSV_FILE_PATH} no existe")
+
+    # Ejecuta el comando para subir el archivo a HDFS
+    result = subprocess.run(
+        ["hdfs", "dfs", "-put", CSV_FILE_PATH, hdfs_path],
+        capture_output=True,
+        text=True
+    )
+
+    if result.returncode != 0:
+        raise Exception(f"Error al subir el CSV a HDFS: {result.stderr}")
+    print(f"Archivo CSV subido a HDFS: {hdfs_path}")
+
+def send_csv_path():
+    """Manda un mensaje de kafka al topic al que el servicio de spark esté escuchando."""
+    topic = "spark_input_topic"  # Cambia esto por tu tópico
+    bootstrap_servers = ['localhost:9092']  # Cambia según tu servidor Kafka
+    message = CSV_FILE_PATH  # El mensaje es la ruta del archivo CSV
+
+    # Crea el productor de Kafka
+    producer = KafkaProducer(bootstrap_servers=bootstrap_servers)
+    
+    # Envía el mensaje
+    future = producer.send(topic, message.encode('utf-8'))
+    
+    # Espera hasta que el mensaje se haya enviado con éxito
+    result = future.get(timeout=10)
+    print(f"Mensaje enviado a Kafka al tópico {topic}: {message}")
+
+    # Cierra el productor
+    producer.close()
+
+
+# Definir el DAG
+default_args = {
+    'owner': 'airflow',
+    'start_date': days_ago(1),
+    'retries': 1
+}
+
+with DAG(
+    dag_id='check_and_process_csv_dag',
+    default_args=default_args,
+    schedule_interval='@daily',  # Chequeo diario
+    catchup=False
+) as dag:
+
+    check_csv = PythonOperator(
+        task_id='check_csv',
+        python_callable=check_csv_update
+    )
+
+    #process_data = PythonOperator(
+    #    task_id='process_data',
+    #    python_callable=process_csv
+    #)
+
+    send_data = PythonOperator(
+        task_id='send_data',
+        python_callable=send_csv_file
+    )
+
+    send_path = PythonOperator(
+        task_id='send_path',
+        python_callable=send_csv_path
+    )
+
+    # Definir la secuencia de tareas
+    check_csv >> process_data
+
+
+
+

@@ -1,0 +1,14 @@
+FROM apache/spark:3.3.3
+
+USER root
+WORKDIR /app
+
+COPY script1.py .
+COPY ./start-spark.sh /usr/local/bin/start-spark.sh
+COPY requirements.txt .
+
+RUN pip3 install -r requirements.txt
+
+RUN chmod +x /usr/local/bin/start-spark.sh
+
+ENTRYPOINT ["/usr/local/bin/start-spark.sh"]
